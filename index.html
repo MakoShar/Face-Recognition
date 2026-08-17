@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Detection </title>
+    <!-- Prevent favicon 404 error -->
+    <link rel="icon" href="data:,">
+    <style>
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #222; color: #fff; }
+        video, canvas { border: 2px solid #fff; border-radius: 8px; font: 16px Arial !important;}
+        #video { width: 640px; height: 480px; }
+        #canvas { position: absolute; left: 0; top: 0; }
+        #record-list { max-height: 500px; overflow-y: auto; }
+        #record-list::-webkit-scrollbar { width: 6px; }
+        #record-list::-webkit-scrollbar-track { background: #333; }
+        #record-list::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+        #record-list::-webkit-scrollbar-thumb:hover { background: #777; }
+        .record-entry { transition: all 0.3s ease; }
+        .record-entry:hover { background-color: #333 !important; }
+    </style>
+</head>
+<body>
+    <div style="display: flex; flex-direction: row; width: 100vw; height: 100vh;">
+        <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;">
+            <h1>Face Detection </h1>
+            <button id="start-btn" style="margin: 20px; font-size: 1.2em;">Enable Webcam</button>
+            <div id="status-message" style="margin: 10px; padding: 10px; border-radius: 4px; display: none;"></div>
+            <div style="position: relative; width: 640px; height: 480px;">
+                <video id="video" autoplay muted style="display:none;"></video>
+                <canvas id="overlay" width="640" height="480" style="position: absolute; left: 0; top: 0; display:none;"></canvas>
+            </div>
+            
+            <!-- Punch-in Display Area -->
+            <div id="punch-in-display" style="margin-top: 20px; padding: 20px; background: #333; border-radius: 8px; display: none; min-width: 400px;">
+                <h3 style="margin: 0 0 15px 0; color: #4CAF50; text-align: center;">✅ PUNCH-IN DETECTED</h3>
+                <div style="display: flex; align-items: center; gap: 20px;">
+                    <img id="punch-in-photo" style="width: 100px; height: 100px; border-radius: 8px; border: 2px solid #4CAF50;" />
+                    <div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: #fff;" id="punch-in-name"></div>
+                        <div style="color: #bbb; margin-top: 5px;" id="punch-in-filename"></div>
+                        <div style="color: #4CAF50; margin-top: 5px; font-weight: bold;" id="punch-in-time"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div id="record-section" style="flex: 0 0 350px; background: #181818; color: #fff; padding: 24px; overflow-y: auto; border-left: 2px solid #333;">
+            <h2>Recognition Record (0/10)</h2>
+            <div style="margin-bottom: 20px;">
+                <button id="download-json" style="margin-right: 10px;">Download JSON</button>
+                <button id="clear-records" style="background: #ff4444; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer;">Clear All</button>
+            </div>
+            <ul id="record-list" style="list-style: none; padding: 0;"></ul>
+        </div>
+    </div>
+    <script src="face-api.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('overlay');
+        const startBtn = document.getElementById('start-btn');
+        const statusMessage = document.getElementById('status-message');
+        const displaySize = { width: 640, height: 480 };
+        // Face Images here
+        const labeledFaceDescriptors = [];
+        let faceImageFiles = []; // Store the list of face image files
+        const recordList = document.getElementById('record-list');
+        const downloadBtn = document.getElementById('download-json');
+        const clearBtn = document.getElementById('clear-records');
+        let recognitionRecord = [];
+        
+        // Punch-in system variables
+        let punchInRecord = [];
+        let punchOutRecord = [];
+        let currentlyOnline = [];
+        let continuousRecognition = {}; // Track how long each person has been recognized
+        const PUNCH_IN_THRESHOLD = 10000; // 10 seconds in milliseconds
+        const PUNCH_OUT_THRESHOLD = 10000; // 10 seconds in milliseconds
+
+        function showStatus(message, type = 'info') {
+            statusMessage.textContent = message;
+            statusMessage.style.display = 'block';
+            statusMessage.style.backgroundColor = type === 'error' ? '#ff4444' : 
+                                                 type === 'success' ? '#44ff44' : '#4444ff';
+            statusMessage.style.color = '#fff';
+            
+            // Hide after 5 seconds for non-error messages
+            if (type !== 'error') {
+                setTimeout(() => {
+                    statusMessage.style.display = 'none';
+                }, 5000);
+            }
+        }
+
+        // Clear records functionality
+        clearBtn.onclick = function() {
+            if (confirm('Are you sure you want to clear all recognition records? This will also clear punch-in/out records and currently online status.')) {
+                recognitionRecord = [];
+                punchInRecord = [];
+                punchOutRecord = [];
+                currentlyOnline = [];
+                continuousRecognition = {};
+                
+                updateRecordDisplay();
+                saveToLocalStorage(); // Clear from localStorage
+                saveRecordToServer(); // Clear on server
+                savePunchInToServer(); // Clear punch-in records
+                savePunchOutToServer(); // Clear punch-out records
+                saveCurrentlyOnlineToServer(); // Clear online status
+                
+                // Clear localStorage
+                localStorage.setItem('punchInRecords', JSON.stringify([]));
+                localStorage.setItem('punchOutRecords', JSON.stringify([]));
+                localStorage.setItem('currentlyOnline', JSON.stringify([]));
+                
+                console.log('All records cleared (recognition, punch-in, punch-out, online status)');
+                showStatus('All records cleared successfully', 'success');
+            }
+        };
+
+        async function startWebcam() {
+            try {
+                console.log('🎥 Requesting webcam access...');
+                
+                // More specific video constraints with fallbacks
+                const constraints = {
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'user'
+                    }
+                };
+                
+                // Try with specific constraints first
+                let stream;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (specificError) {
+                    console.log('Specific constraints failed, trying basic video...');
+                    // Fallback to basic video if specific constraints fail
+                    stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                }
+                
+                console.log('✅ Webcam access granted');
+                video.srcObject = stream;
+                
+                // Wait for video to be ready
+                return new Promise((resolve, reject) => {
+                    video.onloadedmetadata = () => {
+                        console.log('📹 Video metadata loaded');
+                        video.style.display = '';
+                        canvas.style.display = '';
+                        startBtn.style.display = 'none';
+                        resolve();
+                    };
+                    
+                    video.onerror = (error) => {
+                        console.error('Video error:', error);
+                        reject(new Error('Video failed to load'));
+                    };
+                    
+                    // Timeout after 10 seconds
+                    setTimeout(() => {
+                        reject(new Error('Video loading timeout'));
+                    }, 10000);
+                });
+                
+            } catch (err) {
+                console.error('❌ Webcam error:', err);
+                let errorMessage = 'Error accessing webcam: ' + err.message;
+                
+                if (err.name === 'NotAllowedError') {
+                    errorMessage = 'Camera access denied. Please:\n1. Allow camera permissions in your browser\n2. Refresh the page and try again';
+                } else if (err.name === 'NotFoundError') {
+                    errorMessage = 'No camera found. Please:\n1. Connect a webcam\n2. Check if other apps are using the camera';
+                } else if (err.name === 'NotReadableError') {
+                    errorMessage = 'Camera is busy. Please:\n1. Close other apps using the camera\n2. Refresh the page and try again';
+                } else if (err.message.includes('timeout')) {
+                    errorMessage = 'Camera timeout. Please:\n1. Try refreshing the page\n2. Check if your camera is working in other apps';
+                }
+                
+                alert(errorMessage);
+                
+                // Reset button state
+                startBtn.style.display = '';
+                startBtn.textContent = 'Try Again';
+            }
+        }
+
+        async function loadModels() {
+            console.log('🚀 Loading AI models...');
+            
+            try {
+                console.log('📦 Loading SSD MobileNet v1...');
+       		    await faceapi.nets.ssdMobilenetv1.loadFromUri('./models/ssd_mobilenetv1');
+       		    console.log('✅ SSD MobileNet v1 loaded');
+       		    
+       		    console.log('📦 Loading Face Recognition Net...');
+       		    await faceapi.nets.faceRecognitionNet.loadFromUri('./models/face_recognition');
+       		    console.log('✅ Face Recognition Net loaded');
+       		    
+       		    console.log('📦 Loading Face Landmark 68 Net...');
+      		    await faceapi.nets.faceLandmark68Net.loadFromUri('./models/face_landmark_68');
+      		    console.log('✅ Face Landmark 68 Net loaded');
+      		    
+                console.log('🎯 All models loaded successfully!');
+   		    } catch (err) {
+     		    console.error('❌ Model loading failed:', err);
+     		    alert("Model loading failed: " + err.message + "\n\nPlease check that all model files are present in the models folder.");
+  			}
+        }
+
+        async function getFaceImageFiles() {
+            // Try to fetch the list of images from the Faces folder
+            // This requires the server to allow directory listing or provide an API endpoint
+            try {
+                const response = await fetch('./Faces/');
+                const text = await response.text();
+                // Parse HTML directory listing for image files (works with some dev servers)
+                const matches = [...text.matchAll(/href="([^"]+\.(jpg|jpeg|png|gif))"/gi)];
+                return matches.map(m => m[1]).filter(f => !f.startsWith('.'));
+            } catch (e) {
+                // Fallback: use hardcoded list if fetch fails
+                console.log('Directory listing failed, using hardcoded face list');
+                return ["Aaditya_Verma.png", "Anoop_Verma.jpg"];
+            }
+        }
+
+        async function loadLabeledImages() {
+            const files = await getFaceImageFiles();
+            faceImageFiles = files; // Store for later use
+            labeledFaceDescriptors.length = 0;
+            
+            for (const file of files) {
+                const label = file.replace(/\.[^/.]+$/, "");
+                const imgPath = `./Faces/${file}`;
+                console.log('🖼️ Loading face image:', imgPath);
+                
+                try {
+                    const img = await faceapi.fetchImage(imgPath);
+                    const detections = await faceapi.detectSingleFace(img, new faceapi.SsdMobilenetv1Options()).withFaceLandmarks().withFaceDescriptor();
+                    
+                    if (!detections) {
+                        console.warn(`❌ No face found in image: ${file}`);
+                        continue;
+                    }
+                    
+                    // Check descriptor quality
+                    const descriptor = detections.descriptor;
+                    if (descriptor && descriptor.length === 128) {
+                        labeledFaceDescriptors.push(new faceapi.LabeledFaceDescriptors(label, [descriptor]));
+                        console.log(`✅ Face descriptor loaded for: ${label} (quality: ${Math.round(detections.detection.score * 100)}%)`);
+                    } else {
+                        console.warn(`❌ Invalid descriptor for: ${file}`);
+                    }
+                } catch (error) {
+                    console.error(`❌ Error loading face image ${file}:`, error);
+                }
+            }
+            
+            console.log(`🎯 Total faces loaded: ${labeledFaceDescriptors.length}`);
+        }
+
+        function addRecord(name) {
+            const now = new Date();
+            const time = now.toLocaleTimeString();
+            const newRecord = { name, time };
+            
+            // Add new record to the beginning of the array (newest first)
+            recognitionRecord.unshift(newRecord);
+            
+            // Keep only the latest 10 entries
+            if (recognitionRecord.length > 10) {
+                recognitionRecord = recognitionRecord.slice(0, 10);
+            }
+            
+            // Update the display
+            updateRecordDisplay();
+            
+            // Save to both localStorage and server
+            saveToLocalStorage();
+            saveRecordToServer();
+        }
+
+        function saveRecordToServer() {
+            fetch('/save-records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(recognitionRecord, null, 2)
+            }).then(response => {
+                if (response.ok) {
+                    console.log('✅ Records saved to server successfully');
+                } else {
+                    console.warn('⚠️ Server save failed, but localStorage backup is available');
+                }
+            }).catch(err => {
+                console.warn('⚠️ Could not save to server, but localStorage backup is available:', err.message);
+            });
+        }
+
+        function savePunchOutToServer() {
+            fetch('/save-punch-out', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(punchOutRecord, null, 2)
+            }).then(response => {
+                if (response.ok) {
+                    console.log('✅ Punch-out records saved to server successfully');
+                } else {
+                    console.warn('⚠️ Punch-out server save failed, but localStorage backup is available');
+                }
+            }).catch(err => {
+                console.warn('⚠️ Could not save punch-out to server, but localStorage backup is available:', err.message);
+            });
+        }
+
+        function saveCurrentlyOnlineToServer() {
+            fetch('/save-currently-online', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(currentlyOnline, null, 2)
+            }).then(response => {
+                if (response.ok) {
+                    console.log('✅ Currently online records saved to server successfully');
+                } else {
+                    console.warn('⚠️ Currently online server save failed, but localStorage backup is available');
+                }
+            }).catch(err => {
+                console.warn('⚠️ Could not save currently online to server, but localStorage backup is available:', err.message);
+            });
+        }
+
+        function savePunchInToServer() {
+            fetch('/save-punch-in', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(punchInRecord, null, 2)
+            }).then(response => {
+                if (response.ok) {
+                    console.log('✅ Punch-in records saved to server successfully');
+                } else {
+                    console.warn('⚠️ Punch-in server save failed, but localStorage backup is available');
+                }
+            }).catch(err => {
+                console.warn('⚠️ Could not save punch-in to server, but localStorage backup is available:', err.message);
+            });
+        }
+
+        function addPunchInRecord(name, filename) {
+            const now = new Date();
+            const timestamp = now.toISOString();
+            const time = now.toLocaleTimeString();
+            const date = now.toLocaleDateString();
+            
+            const punchInEntry = { 
+                name, 
+                filename, 
+                timestamp, 
+                time, 
+                date 
+            };
+            
+            // Add to punch-in records
+            punchInRecord.push(punchInEntry);
+            
+            // Add to currently online (if not already there)
+            if (!currentlyOnline.find(person => person.name === name)) {
+                currentlyOnline.push({
+                    name,
+                    filename,
+                    punchInTime: timestamp,
+                    punchInTimeFormatted: time,
+                    status: 'online'
+                });
+                saveCurrentlyOnlineToServer();
+            }
+            
+            // Save to localStorage and server
+            localStorage.setItem('punchInRecords', JSON.stringify(punchInRecord));
+            localStorage.setItem('currentlyOnline', JSON.stringify(currentlyOnline));
+            savePunchInToServer();
+            
+            // Show punch-in display
+            showPunchInDisplay(name, filename, time, 'IN');
+            
+            console.log(`🎯 PUNCH-IN: ${name} (${filename}) at ${time}`);
+            console.log(`👥 Currently online: ${currentlyOnline.length} people`);
+        }
+
+        function addPunchOutRecord(name, filename) {
+            const now = new Date();
+            const timestamp = now.toISOString();
+            const time = now.toLocaleTimeString();
+            const date = now.toLocaleDateString();
+            
+            const punchOutEntry = { 
+                name, 
+                filename, 
+                timestamp, 
+                time, 
+                date 
+            };
+            
+            // Add to punch-out records
+            punchOutRecord.push(punchOutEntry);
+            
+            // Remove from currently online
+            currentlyOnline = currentlyOnline.filter(person => person.name !== name);
+            
+            // Save to localStorage and server
+            localStorage.setItem('punchOutRecords', JSON.stringify(punchOutRecord));
+            localStorage.setItem('currentlyOnline', JSON.stringify(currentlyOnline));
+            savePunchOutToServer();
+            saveCurrentlyOnlineToServer();
+            
+            // Show punch-out display
+            showPunchInDisplay(name, filename, time, 'OUT');
+            
+            console.log(`🎯 PUNCH-OUT: ${name} (${filename}) at ${time}`);
+            console.log(`👥 Currently online: ${currentlyOnline.length} people`);
+        }
+
+        function showPunchInDisplay(name, filename, time, action) {
+            const display = document.getElementById('punch-in-display');
+            const photo = document.getElementById('punch-in-photo');
+            const nameElement = document.getElementById('punch-in-name');
+            const filenameElement = document.getElementById('punch-in-filename');
+            const timeElement = document.getElementById('punch-in-time');
+            const headerElement = display.querySelector('h3');
+            
+            // Set the content based on action
+            photo.src = `./Faces/${filename}`;
+            nameElement.textContent = name;
+            filenameElement.textContent = `File: ${filename}`;
+            
+            if (action === 'IN') {
+                headerElement.textContent = '✅ PUNCH-IN DETECTED';
+                headerElement.style.color = '#4CAF50';
+                timeElement.textContent = `Punched in at: ${time}`;
+                timeElement.style.color = '#4CAF50';
+                photo.style.border = '2px solid #4CAF50';
+            } else if (action === 'OUT') {
+                headerElement.textContent = '🔴 PUNCH-OUT DETECTED';
+                headerElement.style.color = '#ff4444';
+                timeElement.textContent = `Punched out at: ${time}`;
+                timeElement.style.color = '#ff4444';
+                photo.style.border = '2px solid #ff4444';
+            }
+            
+            // Show the display
+            display.style.display = 'block';
+            
+            // Hide after 5 seconds
+            setTimeout(() => {
+                display.style.display = 'none';
+            }, 5000);
+        }
+
+        function saveToLocalStorage() {
+            try {
+                localStorage.setItem('faceRecognitionRecords', JSON.stringify(recognitionRecord));
+            } catch (error) {
+                console.warn('Could not save to localStorage:', error);
+            }
+        }
+
+        function loadFromLocalStorage() {
+            try {
+                const saved = localStorage.getItem('faceRecognitionRecords');
+                if (saved) {
+                    recognitionRecord = JSON.parse(saved);
+                    console.log(`Loaded ${recognitionRecord.length} records from localStorage`);
+                }
+                
+                // Load punch-in records
+                const savedPunchIn = localStorage.getItem('punchInRecords');
+                if (savedPunchIn) {
+                    punchInRecord = JSON.parse(savedPunchIn);
+                    console.log(`Loaded ${punchInRecord.length} punch-in records from localStorage`);
+                }
+                
+                // Load punch-out records
+                const savedPunchOut = localStorage.getItem('punchOutRecords');
+                if (savedPunchOut) {
+                    punchOutRecord = JSON.parse(savedPunchOut);
+                    console.log(`Loaded ${punchOutRecord.length} punch-out records from localStorage`);
+                }
+                
+                // Load currently online
+                const savedOnline = localStorage.getItem('currentlyOnline');
+                if (savedOnline) {
+                    currentlyOnline = JSON.parse(savedOnline);
+                    console.log(`Loaded ${currentlyOnline.length} currently online people from localStorage`);
+                    console.log('Currently online:', currentlyOnline.map(p => p.name).join(', '));
+                }
+            } catch (error) {
+                console.warn('Could not load from localStorage:', error);
+                recognitionRecord = [];
+                punchInRecord = [];
+                punchOutRecord = [];
+                currentlyOnline = [];
+            }
+        }
+
+        function updateRecordDisplay() {
+            // Clear the current list
+            recordList.innerHTML = '';
+            
+            // Add each record to the display (newest first)
+            recognitionRecord.forEach((record, index) => {
+                const li = document.createElement('li');
+                li.style.marginBottom = '8px';
+                li.style.padding = '8px';
+                li.style.backgroundColor = index === 0 ? '#2a2a2a' : '#1a1a1a'; // Highlight newest entry
+                li.style.borderRadius = '4px';
+                li.style.borderLeft = index === 0 ? '3px solid #4CAF50' : '3px solid #333';
+                
+                // Create a more detailed display
+                const nameSpan = document.createElement('span');
+                nameSpan.style.fontWeight = 'bold';
+                nameSpan.style.color = record.name === 'unknown' ? '#ff6b6b' : '#4CAF50';
+                nameSpan.textContent = record.name === 'unknown' ? 'Unknown Person' : record.name;
+                
+                const timeSpan = document.createElement('span');
+                timeSpan.style.fontSize = '0.9em';
+                timeSpan.style.color = '#bbb';
+                timeSpan.style.display = 'block';
+                timeSpan.textContent = record.time;
+                
+                const indexSpan = document.createElement('span');
+                indexSpan.style.fontSize = '0.8em';
+                indexSpan.style.color = '#666';
+                indexSpan.style.float = 'right';
+                indexSpan.textContent = `#${index + 1}`;
+                
+                li.appendChild(nameSpan);
+                li.appendChild(timeSpan);
+                li.appendChild(indexSpan);
+                
+                recordList.appendChild(li);
+            });
+            
+            // Show count in the header
+            const recordHeader = document.querySelector('#record-section h2');
+            recordHeader.textContent = `Recognition Record (${recognitionRecord.length}/10)`;
+        }
+
+        downloadBtn.onclick = function() {
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(recognitionRecord, null, 2));
+            const dlAnchor = document.createElement('a');
+            dlAnchor.setAttribute("href", dataStr);
+            dlAnchor.setAttribute("download", "recognition_record.json");
+            dlAnchor.click();
+        };
+
+        let lastRecognized = {};
+
+       
+        async function onPlay() {
+ 
+           if (labeledFaceDescriptors.length === 0) {
+                       console.warn('No known faces loaded. Cannot perform recognition.');
+                       // return;
+                }
+          
+            if (video.paused || video.ended) return setTimeout(() => onPlay(), 100);
+           
+            const detections = await faceapi.detectAllFaces(video, new faceapi.SsdMobilenetv1Options()).withFaceLandmarks().withFaceDescriptors();
+
+            const resizedDetections = faceapi.resizeResults(detections, displaySize);
+            canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (labeledFaceDescriptors.length > 0) {
+                // Use a much stricter threshold for better accuracy (lower = stricter)
+                const faceMatcher = new faceapi.FaceMatcher(labeledFaceDescriptors, 0.35);
+                console.log('faceMatcher Matching against', labeledFaceDescriptors.length, 'known faces');
+
+                resizedDetections.forEach((detection, index) => {
+                    const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+                    const label = bestMatch.label;
+                    const distance = bestMatch.distance;
+                    const confidence = Math.round((1 - distance) * 100);
+                    const box = detection.detection.box;
+                    
+                    // Only accept matches with very high confidence
+                    const isHighConfidence = distance < 0.35;
+                    const displayLabel = isHighConfidence ? label : "unknown";
+                    
+                    // Check if person is currently online
+                    const isCurrentlyOnline = currentlyOnline.find(person => person.name === displayLabel);
+                    
+                    // Draw bounding box for each detected face
+                    const drawBox = new faceapi.draw.DrawBox(box, { 
+                               label: displayLabel === "unknown" ? "Not Recognized" : `${displayLabel} (${confidence}%)${isCurrentlyOnline ? ' 🟢' : ''}`,
+                               boxColor: displayLabel === "unknown" ? "red" : (confidence > 80 ? "green" : "orange"),
+                               lineWidth: 2
+                         });
+                    console.log(`Face ${index + 1} - bestMatch: ${bestMatch.toString()}, Distance: ${distance.toFixed(3)}, Confidence: ${confidence}%`);
+
+                    drawBox.draw(canvas);
+                    
+                    // Track continuous recognition for punch-in system
+                    const name = displayLabel;
+                    const now = Date.now();
+                    
+                    if (isHighConfidence && name !== "unknown") {
+                        // Initialize or update continuous recognition tracking
+                        if (!continuousRecognition[name]) {
+                            continuousRecognition[name] = {
+                                startTime: now,
+                                lastSeen: now,
+                                punchedIn: false,
+                                filename: null
+                            };
+                            
+                            // Find the filename for this person
+                            const matchingFile = faceImageFiles.find(file => file.replace(/\.[^/.]+$/, "") === name);
+                            continuousRecognition[name].filename = matchingFile;
+                        } else {
+                            continuousRecognition[name].lastSeen = now;
+                        }
+                        
+                        // Check if they've been recognized continuously for 10 seconds
+                        const recognitionDuration = now - continuousRecognition[name].startTime;
+                        const isCurrentlyOnlineForPunch = currentlyOnline.find(person => person.name === name);
+                        
+                        if (recognitionDuration >= PUNCH_IN_THRESHOLD && !continuousRecognition[name].punchedIn) {
+                            if (!isCurrentlyOnlineForPunch) {
+                                // Person is not online - trigger punch-in
+                                addPunchInRecord(name, continuousRecognition[name].filename);
+                                continuousRecognition[name].punchedIn = true;
+                                continuousRecognition[name].action = 'punched-in';
+                            } else {
+                                // Person is already online - trigger punch-out
+                                addPunchOutRecord(name, continuousRecognition[name].filename);
+                                continuousRecognition[name].punchedIn = true;
+                                continuousRecognition[name].action = 'punched-out';
+                                
+                                // Reset continuous recognition after punch-out to allow future punch-ins
+                                setTimeout(() => {
+                                    if (continuousRecognition[name]) {
+                                        delete continuousRecognition[name];
+                                        console.log(`🔄 Reset recognition tracking for ${name} after punch-out`);
+                                    }
+                                }, 2000); // Reset after 2 seconds
+                            }
+                        }
+                        
+                        // Regular recording (every 5 seconds)
+                        if (!lastRecognized[name] || now - lastRecognized[name] > 5000) {
+                            addRecord(name);
+                            lastRecognized[name] = now;
+                            console.log(`📝 Recorded: ${name} (${confidence}% confidence) at ${new Date(now).toLocaleTimeString()}`);
+                        } else {
+                            console.log(`⏳ Skipping ${name} - recorded ${Math.floor((now - lastRecognized[name]) / 1000)}s ago (${confidence}% confidence)`);
+                        }
+                        
+                        // Show punch-in/out progress for debugging
+                        if (recognitionDuration < PUNCH_IN_THRESHOLD) {
+                            const secondsLeft = Math.ceil((PUNCH_IN_THRESHOLD - recognitionDuration) / 1000);
+                            const action = isCurrentlyOnlineForPunch ? 'punch-out' : 'punch-in';
+                            const onlineStatus = isCurrentlyOnlineForPunch ? ' (ONLINE)' : ' (OFFLINE)';
+                            console.log(`⏰ ${name}${onlineStatus} recognized for ${Math.floor(recognitionDuration/1000)}s - ${action} in ${secondsLeft}s`);
+                        }
+                        
+                    } else {
+                        // Reset continuous recognition if person is not recognized or low confidence
+                        if (continuousRecognition[name]) {
+                            delete continuousRecognition[name];
+                            console.log(`🔄 Reset continuous recognition for ${name}`);
+                        }
+                        
+                        if (!isHighConfidence) {
+                            console.log(`❌ Low confidence match: ${label} (${confidence}%) - marking as UNKNOWN`);
+                        }
+                    }
+                    
+                    // Clean up old continuous recognition entries (if person hasn't been seen for 3 seconds)
+                    Object.keys(continuousRecognition).forEach(personName => {
+                        if (now - continuousRecognition[personName].lastSeen > 3000) {
+                            delete continuousRecognition[personName];
+                            console.log(`🧹 Cleaned up stale recognition for ${personName}`);
+                        }
+                    });
+                });
+            } else {
+                // If no known faces loaded, just draw detection boxes
+                faceapi.draw.drawDetections(canvas, resizedDetections);
+            }
+            
+            // Show detection count
+            if (resizedDetections.length > 0) {
+                console.log(`👥 Detected ${resizedDetections.length} face(s) in current frame`);
+            }
+            
+            requestAnimationFrame(onPlay);
+        }
+
+        async function init() {
+            // Load saved records from localStorage
+            loadFromLocalStorage();
+            
+            // Initialize the record display
+            updateRecordDisplay();
+            
+            showStatus('Loading AI models...', 'info');
+            await loadModels();
+            
+            showStatus('Loading face images...', 'info');
+            await loadLabeledImages();
+            
+            showStatus('Ready! Click "Enable Webcam" to start face recognition.', 'success');
+            
+            startBtn.addEventListener('click', async () => {
+                startBtn.disabled = true;
+                startBtn.textContent = 'Starting...';
+                showStatus('Starting webcam...', 'info');
+                
+                try {
+                    await startWebcam();
+                    showStatus('Webcam started! Face recognition is now active.', 'success');
+                    video.addEventListener('playing', onPlay);
+                } catch (error) {
+                    showStatus('Failed to start webcam: ' + error.message, 'error');
+                    startBtn.disabled = false;
+                    startBtn.textContent = 'Try Again';
+                }
+            });
+        }
+
+        init();
+    </script>
+</body>
+</html> 
