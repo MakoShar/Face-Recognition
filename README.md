@@ -5,6 +5,7 @@ A real-time **face detection and recognition web application** built with JavaSc
 The application uses a webcam to detect and recognize registered faces, record recognition events, and track attendance-related activity.
 
 <img width="1918" height="877" alt="Screenshot 2026-08-17 195805" src="https://github.com/user-attachments/assets/afb01d89-a1df-4514-b658-55413b9bab4e" />
+<img width="1891" height="841" alt="image" src="https://github.com/user-attachments/assets/54af1edf-c013-468a-aa95-7e1f162922ed" />
 
 
 ## ✨ Features
